@@ -796,38 +796,58 @@ export class GoogleMeetBot extends MeetBotBase {
               const speakingSince = new Map<string, number>();
               let calibrationLogged = 0;
 
-              let loggedButtons = false;
+              // The People toggle is a role="button" DIV whose aria-labelledby
+              // points to a hidden span reading "People"/"Personas". Many similar
+              // toggles exist for other panels (most display:none); pick the one
+              // that is visible and labelled People, and respect aria-expanded so
+              // we never toggle it closed.
+              const isVisible = (el: Element): boolean => {
+                try {
+                  const s = getComputedStyle(el);
+                  return s.display !== 'none' && s.visibility !== 'hidden' && (el as HTMLElement).offsetParent !== null;
+                } catch { return false; }
+              };
               const openPeoplePanel = () => {
                 try {
-                  const buttons = Array.from(document.querySelectorAll('button[aria-label]')) as HTMLButtonElement[];
-                  if (!loggedButtons) {
-                    loggedButtons = true;
-                    console.log('DIAR_CALIB buttons:', buttons.map((b) => b.getAttribute('aria-label')).filter(Boolean).slice(0, 30).join(' | '));
+                  const btns = Array.from(document.querySelectorAll('[role="button"][aria-labelledby]'));
+                  for (const btn of btns) {
+                    const label = document.getElementById(btn.getAttribute('aria-labelledby') || '');
+                    const text = (label?.textContent || '').trim();
+                    if (!/^(People|Personas|Participants|Asistentes|Contactos)$/i.test(text)) continue;
+                    if (!isVisible(btn)) continue;
+                    if (btn.getAttribute('aria-expanded') === 'true') return; // already open
+                    (btn as HTMLElement).click();
+                    btn.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
+                    btn.dispatchEvent(new PointerEvent('pointerup', { bubbles: true }));
+                    return;
                   }
-                  // Match the People/participants toggle across locales
-                  const btn = buttons.find((b) => {
-                    const l = (b.getAttribute('aria-label') || '').toLowerCase();
-                    return /people|participant|everyone|persona|asistente|contacto/.test(l);
-                  });
-                  if (btn && btn.getAttribute('aria-pressed') !== 'true') btn.click();
                 } catch { /* ignore */ }
               };
 
-              // Participants panel rows: role=listitem with data-participant-id
-              // and the clean name in aria-label. Falls back to video tiles.
-              const findPanelItems = (): Element[] => {
-                const rows = Array.from(document.querySelectorAll('[role="listitem"][data-participant-id]'));
-                if (rows.length > 0) return rows;
-                return Array.from(document.querySelectorAll('[data-participant-id]'));
-              };
-
-              const nameFromItem = (item: Element): string => {
-                // Panel row aria-label is the clean participant name.
-                const aria = (item.getAttribute('aria-label') || '').trim();
-                if (aria && aria.length < 60) return aria;
-                const span = item.querySelector('.zWGUib');
-                const name = ((span && span.textContent) || '').trim();
+              const cleanName = (n: string): string => {
+                const name = n.trim();
                 return name.length > 0 && name.length < 60 ? name : '';
+              };
+              const nameFromItem = (item: Element): string => {
+                // 1) Participants panel row: clean name in aria-label
+                const aria = (item.getAttribute('aria-label') || '').trim();
+                if (aria && aria.length < 60 && !/microphone|options|pin |presentation|screen/i.test(aria)) return aria;
+                // 2) Name span (panel or tile overlay)
+                const span = item.querySelector('.zWGUib');
+                if (span && span.textContent) { const n = cleanName(span.textContent); if (n) return n; }
+                // 3) Video tile: derive the name from a control button's aria-label
+                //    (the People panel has no reachable toggle in the bot's layout).
+                const btns = Array.from(item.querySelectorAll('button[aria-label]')) as HTMLButtonElement[];
+                for (const b of btns) {
+                  const l = b.getAttribute('aria-label') || '';
+                  const m =
+                    l.match(/^More options for (.+)$/) ||
+                    l.match(/^Pin (.+?) to /) ||
+                    l.match(/^Unpin (.+?) from /) ||
+                    l.match(/^(?:Mute|Unmute) (.+?)'s /);
+                  if (m) { const n = cleanName(m[1]); if (n) return n; }
+                }
+                return '';
               };
 
               const getIndicator = (item: Element): Element | null =>
@@ -850,6 +870,7 @@ export class GoogleMeetBot extends MeetBotBase {
                 let best: string | null = null;
                 let bestRatio = 0;
                 for (const c of Object.keys(classSeen)) {
+                  if (structural.test(c)) continue; // skip container/mic classes
                   const ratio = classSeen[c] / Math.max(indicatorObservations, 1);
                   // silence: very common but not literally always (speakers drop it)
                   if (ratio > 0.4 && ratio < 0.995 && ratio > bestRatio) { bestRatio = ratio; best = c; }
@@ -888,22 +909,25 @@ export class GoogleMeetBot extends MeetBotBase {
               let lastLearnMs = 0;
               const tick = () => {
                 const now = Date.now() - diarStartMs;
-                let items = findPanelItems();
-                if (items.length === 0) {
-                  openPeoplePanel();
-                  items = Array.from(document.querySelectorAll('[data-participant-id]'));
-                }
+                // Prefer the People-panel rows (clean names + indicator). Until the
+                // panel is open, keep trying to open it and fall back to the tiles.
+                const rows = Array.from(document.querySelectorAll('[role="listitem"][data-participant-id]'));
+                if (rows.length === 0) openPeoplePanel();
+                const items = rows.length > 0 ? rows : Array.from(document.querySelectorAll('[data-participant-id]'));
                 const speakingNow = new Set<string>();
                 let anySpeakingSignal = false;
                 for (const item of items) {
                   const name = nameFromItem(item);
-                  if (name) participants.add(name);
+                  const isBot = !!name && /note.?taker|ai.?notes|\brecording\b/i.test(name);
                   const ind = getIndicator(item);
                   if (!ind) continue;
-                  // accumulate class frequencies to learn the silence class
+                  // accumulate class frequencies to learn the silence class (the
+                  // muted bot is a reliable silence sample, so count it too)
                   indicatorObservations++;
                   ind.classList.forEach((c) => { classSeen[c] = (classSeen[c] || 0) + 1; });
-                  if (isItemSpeaking(ind)) { if (name) speakingNow.add(name); anySpeakingSignal = true; }
+                  if (isBot || !name) continue; // don't list/attribute the bot itself
+                  participants.add(name);
+                  if (isItemSpeaking(ind)) { speakingNow.add(name); anySpeakingSignal = true; }
                 }
                 if (now - lastLearnMs > 2000 && indicatorObservations > 15) { recomputeSilenceClass(); lastLearnMs = now; }
                 for (const [name, start] of Array.from(speakingSince)) {
@@ -922,7 +946,7 @@ export class GoogleMeetBot extends MeetBotBase {
                   const now = Date.now() - diarStartMs;
                   const segs = segments.slice();
                   for (const [name, start] of Array.from(speakingSince)) segs.push({ speaker: name, startMs: start, endMs: now });
-                  console.log(`DIAR_STATE participants=${participants.size} segments=${segs.length} openSpeakers=${speakingSince.size} silenceClass=${learnedSilenceClass || '(learning)'}`);
+                  console.log(`DIAR_STATE participants=${participants.size} segments=${segs.length} openSpeakers=${speakingSince.size} silenceClass=${learnedSilenceClass || '(learning)'} names=[${Array.from(participants).join(', ')}]`);
                   (window as any).screenAppSendDiarization(slightlySecretId, JSON.stringify({ participants: Array.from(participants), segments: segs }));
                 } catch { /* ignore */ }
               };
