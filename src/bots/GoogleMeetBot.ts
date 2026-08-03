@@ -191,24 +191,26 @@ export class GoogleMeetBot extends MeetBotBase {
           }
         }
 
-        this._logger.info('Waiting for the input field to be visible...', {
+        // PATCH (tercerpiso fork): the guest flow shows a name input; the
+        // signed-in flow (dedicated Google account via persistent profile) does
+        // NOT. Try to fill the name if the field is present, otherwise skip
+        // straight to the Join button — Google Meet joins the signed-in bot
+        // directly without asking for a name.
+        this._logger.info('Waiting for the input field to be visible (optional when signed in)...', {
           joinRequestAttempt,
           maxJoinRequestAttempts
         });
-        await retryActionWithWait(
-          'Waiting for the input field',
-          async () => await this.page.locator(nameInputSelector).first().waitFor({ state: 'visible', timeout: 10000 }),
-          this._logger,
-          3,
-          15000,
-          async () => {
-            await uploadDebugImage(await this.page.screenshot({ type: 'png', fullPage: true }), 'text-input-field-wait', userId, this._logger, botId);
-          }
-        );
+        try {
+          await this.page.locator(nameInputSelector).first().waitFor({ state: 'visible', timeout: 8000 });
+          this._logger.info('Filling the input field with the name...');
+          await this.page.locator(nameInputSelector).first().fill(displayName);
+        } catch {
+          this._logger.info('No name input field found — assuming signed-in profile, going straight to Join...', {
+            joinRequestAttempt,
+            maxJoinRequestAttempts
+          });
+        }
 
-        this._logger.info('Filling the input field with the name...');
-        await this.page.locator(nameInputSelector).first().fill(displayName);
-        
         await retryActionWithWait(
           'Clicking the "Ask to join" button',
           async () => {
