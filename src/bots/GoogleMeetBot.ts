@@ -677,6 +677,19 @@ export class GoogleMeetBot extends MeetBotBase {
       await uploader.saveDataToTempFile(buffer);
     });
 
+    // Diarization (tercerpiso fork): the page periodically posts the participant
+    // list + active-speaker timeline scraped from the DOM; stash it on the
+    // uploader so it rides along in the completion webhook's metadata.
+    await this.page.exposeFunction('screenAppSendDiarization', (slightlySecretId: string, data: string) => {
+      if (slightlySecretId !== this.slightlySecretId) return;
+      try {
+        const parsed = JSON.parse(data) as { participants?: string[]; segments?: { speaker: string; startMs: number; endMs: number }[] };
+        (uploader as unknown as { setDiarizationData?: (d: unknown) => void }).setDiarizationData?.(parsed);
+      } catch (e) {
+        this._logger.warn('Failed to parse diarization payload', (e as Error)?.message);
+      }
+    });
+
     await this.page.exposeFunction('screenAppMeetEnd', (slightlySecretId: string, recordedDurationSeconds?: number) => {
       if (slightlySecretId !== this.slightlySecretId) return;
       try {
@@ -694,8 +707,8 @@ export class GoogleMeetBot extends MeetBotBase {
 
     // Inject the MediaRecorder code into the browser context using page.evaluate
     await this.page.evaluate(
-      async ({ teamId, duration, inactivityLimit, loneParticipantExitDelayMs, userId, slightlySecretId, activateInactivityDetectionAfter, activateInactivityDetectionAfterMinutes, mimeTypes, audioOnly }:
-      { teamId:string, userId: string, duration: number, inactivityLimit: number, loneParticipantExitDelayMs: number, slightlySecretId: string, activateInactivityDetectionAfter: string, activateInactivityDetectionAfterMinutes: number, mimeTypes: string[], audioOnly: boolean }) => {
+      async ({ teamId, duration, inactivityLimit, loneParticipantExitDelayMs, userId, slightlySecretId, activateInactivityDetectionAfter, activateInactivityDetectionAfterMinutes, mimeTypes, audioOnly, captureDiarization, diarizationPollMs }:
+      { teamId:string, userId: string, duration: number, inactivityLimit: number, loneParticipantExitDelayMs: number, slightlySecretId: string, activateInactivityDetectionAfter: string, activateInactivityDetectionAfterMinutes: number, mimeTypes: string[], audioOnly: boolean, captureDiarization: boolean, diarizationPollMs: number }) => {
         let timeoutId: NodeJS.Timeout;
         let inactivitySilenceDetectionTimeout: NodeJS.Timeout;
         let isOnValidGoogleMeetPageInterval: NodeJS.Timeout;
@@ -767,6 +780,122 @@ export class GoogleMeetBot extends MeetBotBase {
           console.log(`Media Recorder will use ${recordMimeType} codecs...`);
           const mediaRecorder = new MediaRecorder(recordStream, { mimeType: recordMimeType });
           console.log(`Media Recorder actual mime type: ${mediaRecorder.mimeType}`);
+
+          // ── Diarization capture (tercerpiso fork) ──────────────────────────
+          // Scrape the participant list + active-speaker timeline from the DOM.
+          // Selectors here are Google-Meet-specific and DO break on redesigns;
+          // when nothing is detected we log a tile sample (DIAR_CALIB) so the
+          // speaking/name selectors can be recalibrated from a real meeting.
+          if (captureDiarization) {
+            try {
+              const diarStartMs = Date.now();
+              const participants = new Set<string>();
+              const segments: { speaker: string; startMs: number; endMs: number }[] = [];
+              const speakingSince = new Map<string, number>();
+              let calibrationLogged = 0;
+
+              const openPeoplePanel = () => {
+                try {
+                  const btn = document.querySelector(
+                    'button[aria-label^="People"], button[aria-label^="Show everyone"], button[aria-label*="participant" i], button[aria-label^="Personas"], button[aria-label^="Mostrar a todos"]'
+                  ) as HTMLButtonElement | null;
+                  if (btn && btn.getAttribute('aria-pressed') !== 'true') btn.click();
+                } catch { /* ignore */ }
+              };
+
+              // Find the participants panel list (popup "People"/"Personas").
+              const findPanelItems = (): Element[] => {
+                // The panel renders each participant as a list item / role=listitem.
+                const selectors = [
+                  '[role="list"] [role="listitem"]',
+                  'div[aria-label*="articipant" i] [role="listitem"]',
+                  'div[aria-label*="ersona" i] [role="listitem"]',
+                  '[data-participant-id][role="listitem"]',
+                ];
+                for (const sel of selectors) {
+                  const items = Array.from(document.querySelectorAll(sel));
+                  if (items.length > 0) return items;
+                }
+                return [];
+              };
+
+              const nameFromItem = (item: Element): string => {
+                // Prefer an explicit name node, fall back to the item's own text.
+                const cand = item.querySelector('[data-self-name], span, div');
+                let name = ((cand && cand.textContent) || item.textContent || '').trim();
+                // panel rows often append role/"You"; keep the leading name line
+                name = name.split('\n')[0].trim();
+                return name.length > 0 && name.length < 60 ? name : '';
+              };
+
+              // Speaking detection: within a panel row, Meet toggles a mic/voice
+              // indicator when the person talks. We can't know the exact class up
+              // front, so we try several signals AND dump the row HTML for
+              // calibration when we detect nothing.
+              const isItemSpeaking = (item: Element): boolean => {
+                if (item.querySelector('[class*="speaking" i], [aria-label*="speaking" i], [aria-label*="hablando" i], [class*="voiceLevel" i], [class*="isSpeaking" i]')) return true;
+                // animated mic bars: an svg/div whose inline style animates opacity/height
+                const anim = item.querySelector('[jsname] [style*="animation"], [style*="transform: scale"]');
+                if (anim) return true;
+                return false;
+              };
+
+              const dumpCalibration = (items: Element[]) => {
+                if (calibrationLogged >= 4) return;
+                calibrationLogged++;
+                const panel = document.querySelector('[role="list"]') || document.body;
+                console.log('DIAR_CALIB panel-outer:', (panel as HTMLElement).outerHTML.slice(0, 1200));
+                items.slice(0, 3).forEach((it, i) => {
+                  console.log(`DIAR_CALIB item[${i}] name="${nameFromItem(it)}":`, (it as HTMLElement).outerHTML.slice(0, 900));
+                });
+              };
+
+              const tick = () => {
+                const now = Date.now() - diarStartMs;
+                let items = findPanelItems();
+                if (items.length === 0) {
+                  // panel not open/empty → make sure it's open and fall back to tiles
+                  openPeoplePanel();
+                  items = Array.from(document.querySelectorAll('[data-participant-id]'));
+                }
+                const speakingNow = new Set<string>();
+                let anySpeakingSignal = false;
+                for (const item of items) {
+                  const name = nameFromItem(item);
+                  if (name) participants.add(name);
+                  if (isItemSpeaking(item)) { if (name) speakingNow.add(name); anySpeakingSignal = true; }
+                }
+                for (const [name, start] of Array.from(speakingSince)) {
+                  if (!speakingNow.has(name)) { segments.push({ speaker: name, startMs: start, endMs: now }); speakingSince.delete(name); }
+                }
+                for (const name of Array.from(speakingNow)) {
+                  if (!speakingSince.has(name)) speakingSince.set(name, now);
+                }
+                // Calibration: dump DOM structure a few times early, and whenever
+                // we have participants but never see a speaking signal.
+                if (items.length > 0 && now > 4000 && (calibrationLogged < 2 || (!anySpeakingSignal && segments.length === 0 && now > 12000 && calibrationLogged < 4))) {
+                  dumpCalibration(items);
+                }
+              };
+
+              const flushDiar = () => {
+                try {
+                  const now = Date.now() - diarStartMs;
+                  const segs = segments.slice();
+                  for (const [name, start] of Array.from(speakingSince)) segs.push({ speaker: name, startMs: start, endMs: now });
+                  console.log(`DIAR_STATE participants=${participants.size} segments=${segs.length} openSpeakers=${speakingSince.size}`);
+                  (window as any).screenAppSendDiarization(slightlySecretId, JSON.stringify({ participants: Array.from(participants), segments: segs }));
+                } catch { /* ignore */ }
+              };
+
+              setTimeout(openPeoplePanel, 3000);
+              setInterval(() => { try { tick(); } catch (e) { console.warn('DIAR tick error', (e as Error)?.message); } }, diarizationPollMs);
+              setInterval(flushDiar, 3000);
+              window.addEventListener('beforeunload', flushDiar);
+            } catch (e) {
+              console.warn('Diarization capture init failed', (e as Error)?.message);
+            }
+          }
           let chunkUploadChain: Promise<void> = Promise.resolve();
           let isStoppingRecording = false;
 
@@ -1284,7 +1413,9 @@ export class GoogleMeetBot extends MeetBotBase {
         activateInactivityDetectionAfterMinutes: config.activateInactivityDetectionAfter,
         activateInactivityDetectionAfter: new Date(new Date().getTime() + config.activateInactivityDetectionAfter * 60 * 1000).toISOString(),
         mimeTypes,
-        audioOnly: config.recordAudioOnly
+        audioOnly: config.recordAudioOnly,
+        captureDiarization: config.captureDiarization,
+        diarizationPollMs: config.diarizationPollMs
       }
     );
   

@@ -82,6 +82,12 @@ class DiskUploader implements IUploader {
   private lastStorageDetails?: Record<string, any>;
   private recordingDuration?: number;
   private firstChunkReceivedAt?: number;
+  // Diarization scraped from the meeting DOM (tercerpiso fork)
+  private diarizationData?: { participants?: string[]; segments?: { speaker: string; startMs: number; endMs: number }[] };
+
+  public setDiarizationData(data: { participants?: string[]; segments?: { speaker: string; startMs: number; endMs: number }[] }): void {
+    this.diarizationData = data;
+  }
 
   private queue: Buffer[];
   private writing: boolean;
@@ -809,6 +815,8 @@ class DiskUploader implements IUploader {
               uploaderType: config.uploaderType,
               duration: this.recordingDuration,
               storage: this.lastStorageDetails,
+              participants: this.diarizationData?.participants,
+              diarization: this.diarizationData?.segments,
             },
           };
           await notifyRecordingCompleted(payload, this._logger);

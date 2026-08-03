@@ -82,6 +82,9 @@ export default {
   retryCount: process.env.RETRY_COUNT ? Number(process.env.RETRY_COUNT) : 2,
   // Record only the audio track for Google Meet (drops the ~10-15x heavier video)
   recordAudioOnly: process.env.RECORD_AUDIO_ONLY === 'true',
+  // Capture the participant list + active-speaker timeline (diarization) via DOM
+  captureDiarization: process.env.CAPTURE_DIARIZATION !== 'false',
+  diarizationPollMs: process.env.DIARIZATION_POLL_MS ? Number(process.env.DIARIZATION_POLL_MS) : 100,
   teamsPrewarmEnabled: process.env.TEAMS_PREWARM_ENABLED === 'true',
   teamsAudioStabilizationMs: process.env.TEAMS_AUDIO_STABILIZATION_MS ? Number(process.env.TEAMS_AUDIO_STABILIZATION_MS) : 1000,
   miscStorageBucket: process.env.GCP_MISC_BUCKET,
