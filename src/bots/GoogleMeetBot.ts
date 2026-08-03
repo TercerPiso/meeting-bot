@@ -865,6 +865,8 @@ export class GoogleMeetBot extends MeetBotBase {
               const classSeen: Record<string, number> = {};
               let indicatorObservations = 0;
               let learnedSilenceClass: string | null = null;
+              // container + mic classes to exclude when learning the silence class
+              const structural = /^(IisKdb|GF8M7d|KUNJSe|x9nQ6|VeFZv|MNVeFb|kT2pkb)$/;
 
               const recomputeSilenceClass = () => {
                 let best: string | null = null;
