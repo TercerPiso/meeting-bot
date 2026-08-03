@@ -918,7 +918,8 @@ export class GoogleMeetBot extends MeetBotBase {
                 let anySpeakingSignal = false;
                 for (const item of items) {
                   const name = nameFromItem(item);
-                  const isBot = !!name && /note.?taker|ai.?notes|\brecording\b/i.test(name);
+                  // Skip the bot itself and screen-share pseudo-tiles ("X's presentation")
+                  const isBot = !!name && /note.?taker|ai.?notes|\brecording\b|presentation|presentaci[oó]n/i.test(name);
                   const ind = getIndicator(item);
                   if (!ind) continue;
                   // accumulate class frequencies to learn the silence class (the
