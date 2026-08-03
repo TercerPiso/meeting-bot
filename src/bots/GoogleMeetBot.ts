@@ -201,7 +201,9 @@ export class GoogleMeetBot extends MeetBotBase {
           maxJoinRequestAttempts
         });
         try {
-          await this.page.locator(nameInputSelector).first().waitFor({ state: 'visible', timeout: 8000 });
+          // Short wait: a signed-in profile never shows the guest name field,
+          // so don't burn 8s here — 3s is enough to catch the anonymous case.
+          await this.page.locator(nameInputSelector).first().waitFor({ state: 'visible', timeout: 3000 });
           this._logger.info('Filling the input field with the name...');
           await this.page.locator(nameInputSelector).first().fill(displayName);
         } catch {
@@ -794,49 +796,82 @@ export class GoogleMeetBot extends MeetBotBase {
               const speakingSince = new Map<string, number>();
               let calibrationLogged = 0;
 
+              let loggedButtons = false;
               const openPeoplePanel = () => {
                 try {
-                  const btn = document.querySelector(
-                    'button[aria-label^="People"], button[aria-label^="Show everyone"], button[aria-label*="participant" i], button[aria-label^="Personas"], button[aria-label^="Mostrar a todos"]'
-                  ) as HTMLButtonElement | null;
+                  const buttons = Array.from(document.querySelectorAll('button[aria-label]')) as HTMLButtonElement[];
+                  if (!loggedButtons) {
+                    loggedButtons = true;
+                    console.log('DIAR_CALIB buttons:', buttons.map((b) => b.getAttribute('aria-label')).filter(Boolean).slice(0, 30).join(' | '));
+                  }
+                  // Match the People/participants toggle across locales
+                  const btn = buttons.find((b) => {
+                    const l = (b.getAttribute('aria-label') || '').toLowerCase();
+                    return /people|participant|everyone|persona|asistente|contacto/.test(l);
+                  });
                   if (btn && btn.getAttribute('aria-pressed') !== 'true') btn.click();
                 } catch { /* ignore */ }
               };
 
-              // Find the participants panel list (popup "People"/"Personas").
+              // Participants panel rows: role=listitem with data-participant-id
+              // and the clean name in aria-label. Falls back to video tiles.
               const findPanelItems = (): Element[] => {
-                // The panel renders each participant as a list item / role=listitem.
-                const selectors = [
-                  '[role="list"] [role="listitem"]',
-                  'div[aria-label*="articipant" i] [role="listitem"]',
-                  'div[aria-label*="ersona" i] [role="listitem"]',
-                  '[data-participant-id][role="listitem"]',
-                ];
-                for (const sel of selectors) {
-                  const items = Array.from(document.querySelectorAll(sel));
-                  if (items.length > 0) return items;
-                }
-                return [];
+                const rows = Array.from(document.querySelectorAll('[role="listitem"][data-participant-id]'));
+                if (rows.length > 0) return rows;
+                return Array.from(document.querySelectorAll('[data-participant-id]'));
               };
 
               const nameFromItem = (item: Element): string => {
-                // Prefer an explicit name node, fall back to the item's own text.
-                const cand = item.querySelector('[data-self-name], span, div');
-                let name = ((cand && cand.textContent) || item.textContent || '').trim();
-                // panel rows often append role/"You"; keep the leading name line
-                name = name.split('\n')[0].trim();
+                // Panel row aria-label is the clean participant name.
+                const aria = (item.getAttribute('aria-label') || '').trim();
+                if (aria && aria.length < 60) return aria;
+                const span = item.querySelector('.zWGUib');
+                const name = ((span && span.textContent) || '').trim();
                 return name.length > 0 && name.length < 60 ? name : '';
               };
 
-              // Speaking detection: within a panel row, Meet toggles a mic/voice
-              // indicator when the person talks. We can't know the exact class up
-              // front, so we try several signals AND dump the row HTML for
-              // calibration when we detect nothing.
-              const isItemSpeaking = (item: Element): boolean => {
-                if (item.querySelector('[class*="speaking" i], [aria-label*="speaking" i], [aria-label*="hablando" i], [class*="voiceLevel" i], [class*="isSpeaking" i]')) return true;
-                // animated mic bars: an svg/div whose inline style animates opacity/height
-                const anim = item.querySelector('[jsname] [style*="animation"], [style*="transform: scale"]');
-                if (anim) return true;
+              const getIndicator = (item: Element): Element | null =>
+                item.querySelector('[jsname="QgSmzd"], .IisKdb');
+
+              // Speaking detection WITHOUT hard-coding Google's rotating obfuscated
+              // class names (they change between Meet deploys).
+              //   1) Primary, class-agnostic: the audio bars run a CSS animation
+              //      while the person talks — getComputedStyle exposes it.
+              //   2) Learned "silence" class: the state class present most of the
+              //      time across indicators (people are silent far more than they
+              //      talk). Speaking = NOT having that class. Excludes structural
+              //      classes (present ~always) and mic classes (fixed per person).
+              //   3) Last resort: the class we saw during calibration.
+              const classSeen: Record<string, number> = {};
+              let indicatorObservations = 0;
+              let learnedSilenceClass: string | null = null;
+
+              const recomputeSilenceClass = () => {
+                let best: string | null = null;
+                let bestRatio = 0;
+                for (const c of Object.keys(classSeen)) {
+                  const ratio = classSeen[c] / Math.max(indicatorObservations, 1);
+                  // silence: very common but not literally always (speakers drop it)
+                  if (ratio > 0.4 && ratio < 0.995 && ratio > bestRatio) { bestRatio = ratio; best = c; }
+                }
+                if (best) learnedSilenceClass = best;
+              };
+
+              const barsAnimating = (ind: Element): boolean => {
+                const els = [ind, ...Array.from(ind.children)];
+                for (const el of els) {
+                  try {
+                    const cs = getComputedStyle(el as Element);
+                    if (cs.animationName && cs.animationName !== 'none' && cs.animationPlayState !== 'paused') return true;
+                  } catch { /* ignore */ }
+                }
+                return false;
+              };
+
+              const isItemSpeaking = (ind: Element): boolean => {
+                if (barsAnimating(ind)) return true;
+                if (learnedSilenceClass) return !ind.classList.contains(learnedSilenceClass);
+                if (ind.classList.contains('Oaajhc')) return true; // pre-calibration fallback
                 return false;
               };
 
@@ -850,11 +885,11 @@ export class GoogleMeetBot extends MeetBotBase {
                 });
               };
 
+              let lastLearnMs = 0;
               const tick = () => {
                 const now = Date.now() - diarStartMs;
                 let items = findPanelItems();
                 if (items.length === 0) {
-                  // panel not open/empty → make sure it's open and fall back to tiles
                   openPeoplePanel();
                   items = Array.from(document.querySelectorAll('[data-participant-id]'));
                 }
@@ -863,16 +898,20 @@ export class GoogleMeetBot extends MeetBotBase {
                 for (const item of items) {
                   const name = nameFromItem(item);
                   if (name) participants.add(name);
-                  if (isItemSpeaking(item)) { if (name) speakingNow.add(name); anySpeakingSignal = true; }
+                  const ind = getIndicator(item);
+                  if (!ind) continue;
+                  // accumulate class frequencies to learn the silence class
+                  indicatorObservations++;
+                  ind.classList.forEach((c) => { classSeen[c] = (classSeen[c] || 0) + 1; });
+                  if (isItemSpeaking(ind)) { if (name) speakingNow.add(name); anySpeakingSignal = true; }
                 }
+                if (now - lastLearnMs > 2000 && indicatorObservations > 15) { recomputeSilenceClass(); lastLearnMs = now; }
                 for (const [name, start] of Array.from(speakingSince)) {
                   if (!speakingNow.has(name)) { segments.push({ speaker: name, startMs: start, endMs: now }); speakingSince.delete(name); }
                 }
                 for (const name of Array.from(speakingNow)) {
                   if (!speakingSince.has(name)) speakingSince.set(name, now);
                 }
-                // Calibration: dump DOM structure a few times early, and whenever
-                // we have participants but never see a speaking signal.
                 if (items.length > 0 && now > 4000 && (calibrationLogged < 2 || (!anySpeakingSignal && segments.length === 0 && now > 12000 && calibrationLogged < 4))) {
                   dumpCalibration(items);
                 }
@@ -883,7 +922,7 @@ export class GoogleMeetBot extends MeetBotBase {
                   const now = Date.now() - diarStartMs;
                   const segs = segments.slice();
                   for (const [name, start] of Array.from(speakingSince)) segs.push({ speaker: name, startMs: start, endMs: now });
-                  console.log(`DIAR_STATE participants=${participants.size} segments=${segs.length} openSpeakers=${speakingSince.size}`);
+                  console.log(`DIAR_STATE participants=${participants.size} segments=${segs.length} openSpeakers=${speakingSince.size} silenceClass=${learnedSilenceClass || '(learning)'}`);
                   (window as any).screenAppSendDiarization(slightlySecretId, JSON.stringify({ participants: Array.from(participants), segments: segs }));
                 } catch { /* ignore */ }
               };
