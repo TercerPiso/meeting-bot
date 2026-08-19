@@ -687,8 +687,7 @@ export class GoogleMeetBot extends MeetBotBase {
     });
 
     let lastParticipantsKey = '';
-    await this.page.exposeFunction('screenAppParticipants', async (slightlySecretId: string, names: string[]) => {
-      if (slightlySecretId !== this.slightlySecretId) return;
+    const publishParticipants = async (names: string[]) => {
       const cleaned = [...new Set((names ?? []).map((n) => String(n).trim()).filter(Boolean))];
       const key = [...cleaned].sort().join('\0');
       if (key === lastParticipantsKey) return;
@@ -706,14 +705,32 @@ export class GoogleMeetBot extends MeetBotBase {
           participants: cleaned,
         },
       }, this._logger);
+    };
+
+    await this.page.exposeFunction('screenAppParticipants', async (slightlySecretId: string, names: string[]) => {
+      if (slightlySecretId !== this.slightlySecretId) return;
+      await publishParticipants(names);
+    });
+
+    await this.page.exposeFunction('screenAppSendDiarization', async (slightlySecretId: string, data: string) => {
+      if (slightlySecretId !== this.slightlySecretId) return;
+      try {
+        const parsed = JSON.parse(data) as { participants?: string[]; segments?: { speaker: string; startMs: number; endMs: number }[] };
+        uploader.setDiarizationData?.(parsed);
+        if (parsed.participants?.length) await publishParticipants(parsed.participants);
+      } catch (e) {
+        this._logger.warn('Failed to parse diarization payload', (e as Error)?.message);
+      }
     });
 
     const { mimeTypes } = getRecordingMimeTypesForExtension(config.uploaderFileExtension);
 
-    // Inject the MediaRecorder code into the browser context using page.evaluate
-    await this.page.evaluate(
-      async ({ teamId, duration, inactivityLimit, loneParticipantExitDelayMs, userId, slightlySecretId, activateInactivityDetectionAfter, activateInactivityDetectionAfterMinutes, mimeTypes, botName }:
-      { teamId:string, userId: string, duration: number, inactivityLimit: number, loneParticipantExitDelayMs: number, slightlySecretId: string, activateInactivityDetectionAfter: string, activateInactivityDetectionAfterMinutes: number, mimeTypes: string[], botName: string }) => {
+    // Inject the MediaRecorder code into the browser context using page.evaluate.
+    // Do not await yet: this promise only settles when the meeting ends, and we
+    // need Playwright to open the People panel while recording is already running.
+    const recordingEvaluate = this.page.evaluate(
+      async ({ teamId, duration, inactivityLimit, loneParticipantExitDelayMs, userId, slightlySecretId, activateInactivityDetectionAfter, activateInactivityDetectionAfterMinutes, mimeTypes, botName, captureDiarization, diarizationPollMs }:
+      { teamId:string, userId: string, duration: number, inactivityLimit: number, loneParticipantExitDelayMs: number, slightlySecretId: string, activateInactivityDetectionAfter: string, activateInactivityDetectionAfterMinutes: number, mimeTypes: string[], botName: string, captureDiarization: boolean, diarizationPollMs: number }) => {
         let timeoutId: NodeJS.Timeout;
         let inactivitySilenceDetectionTimeout: NodeJS.Timeout;
         let isOnValidGoogleMeetPageInterval: NodeJS.Timeout;
@@ -772,35 +789,95 @@ export class GoogleMeetBot extends MeetBotBase {
           let isStoppingRecording = false;
           let lastReportedParticipants = '';
 
-          const scrapeParticipantNames = (): string[] => {
-            const skip = new Set(
-              [botName, 'Note Taker', 'AI Notes', 'You', 'Tú', 'Yo', 'Vos']
-                .map((s) => String(s || '').trim().toLowerCase())
-                .filter(Boolean),
-            );
-            const names = new Set<string>();
-            const add = (raw?: string | null) => {
-              let n = String(raw || '').replace(/\s+/g, ' ').trim();
-              n = n.replace(/\s*\((?:you|tú|yo|me|presentation|presentación|presenting)\)\s*/ig, '').trim();
-              n = n.replace(/['’]s presentation$/i, '').replace(/\s+is presenting$/i, '').trim();
-              if (!n || n.length < 2 || n.length > 80) return;
-              if (/^\d+$/.test(n)) return;
-              if (skip.has(n.toLowerCase())) return;
-              if (/^(people|personas|participantes?|participants?)$/i.test(n)) return;
-              names.add(n);
-            };
+          const skipNames = new Set(
+            [botName, 'Note Taker', 'AI Notes', 'You', 'Tú', 'Yo', 'Vos']
+              .map((s) => String(s || '').trim().toLowerCase())
+              .filter(Boolean),
+          );
 
-            document.querySelectorAll('[data-self-name]').forEach((el) => add(el.getAttribute('data-self-name')));
-            document.querySelectorAll('[data-requested-participant-id], [data-participant-id]').forEach((el) => {
-              const label = el.getAttribute('aria-label');
-              if (label) add(label.split(/,|\. | — | – /)[0]);
-            });
-            document.querySelectorAll('[role="listitem"]').forEach((item) => {
-              const label = item.getAttribute('aria-label');
-              if (label) add(label.split(',')[0]);
-              const text = (item.textContent || '').split('\n').map((s) => s.trim()).find((s) => s.length > 1 && s.length < 60);
-              if (text) add(text);
-            });
+          const isVisible = (el: Element): boolean => {
+            try {
+              const s = getComputedStyle(el);
+              return s.display !== 'none' && s.visibility !== 'hidden' && (el as HTMLElement).offsetParent !== null;
+            } catch {
+              return false;
+            }
+          };
+
+          // People toggle is a role=button whose aria-labelledby reads People/Personas.
+          const openPeoplePanel = () => {
+            try {
+              const btns = Array.from(document.querySelectorAll('[role="button"][aria-labelledby], button[aria-label]'));
+              for (const btn of btns) {
+                const labelled = document.getElementById(btn.getAttribute('aria-labelledby') || '');
+                const text = (labelled?.textContent || btn.getAttribute('aria-label') || '').trim();
+                if (!/^(People|Personas|Participants|Asistentes|Contactos)(\b| -)/i.test(text)) continue;
+                if (!isVisible(btn)) continue;
+                if (btn.getAttribute('aria-expanded') === 'true') return;
+                (btn as HTMLElement).click();
+                btn.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
+                btn.dispatchEvent(new PointerEvent('pointerup', { bubbles: true }));
+                return;
+              }
+            } catch {
+              /* ignore */
+            }
+          };
+
+          const cleanName = (n: string): string => {
+            let name = n.replace(/\s+/g, ' ').trim();
+            name = name.replace(/\s*\((?:you|tú|yo|me)\)\s*/ig, '').trim();
+            if (!name || name.length < 2 || name.length > 80) return '';
+            if (/^\d+$/.test(name)) return '';
+            if (skipNames.has(name.toLowerCase())) return '';
+            if (/note.?taker|ai.?notes|\brecording\b|presentation|presentaci[oó]n/i.test(name)) return '';
+            if (/^(people|personas|participantes?|participants?)$/i.test(name)) return '';
+            return name;
+          };
+
+          const nameFromItem = (item: Element): string => {
+            const aria = (item.getAttribute('aria-label') || '').trim();
+            if (aria && aria.length < 60 && !/microphone|options|pin |presentation|screen/i.test(aria)) {
+              const n = cleanName(aria.split(/,|\. | — | – /)[0]);
+              if (n) return n;
+            }
+            const span = item.querySelector('.zWGUib, [data-self-name]');
+            if (span) {
+              const n = cleanName(span.getAttribute('data-self-name') || span.textContent || '');
+              if (n) return n;
+            }
+            const btns = Array.from(item.querySelectorAll('button[aria-label]')) as HTMLButtonElement[];
+            for (const b of btns) {
+              const l = b.getAttribute('aria-label') || '';
+              const m =
+                l.match(/^More options for (.+)$/) ||
+                l.match(/^Más opciones para (.+)$/) ||
+                l.match(/^Pin (.+?) to /) ||
+                l.match(/^Unpin (.+?) from /) ||
+                l.match(/^(?:Mute|Unmute|Silenciar|Activar micrófono de) (.+?)(?:'s |$)/);
+              if (m) {
+                const n = cleanName(m[1]);
+                if (n) return n;
+              }
+            }
+            return '';
+          };
+
+          const scrapeParticipantNames = (): string[] => {
+            openPeoplePanel();
+            const names = new Set<string>();
+            const rows = Array.from(document.querySelectorAll('[role="listitem"][data-participant-id]'));
+            const items = rows.length > 0 ? rows : Array.from(document.querySelectorAll('[data-participant-id], [data-requested-participant-id]'));
+            for (const item of items) {
+              const name = nameFromItem(item);
+              if (name) names.add(name);
+            }
+            if (names.size === 0) {
+              document.querySelectorAll('[data-self-name]').forEach((el) => {
+                const n = cleanName(el.getAttribute('data-self-name') || '');
+                if (n) names.add(n);
+              });
+            }
             return Array.from(names);
           };
 
@@ -811,6 +888,100 @@ export class GoogleMeetBot extends MeetBotBase {
             lastReportedParticipants = key;
             void (window as any).screenAppParticipants(slightlySecretId, scraped);
           };
+
+          setTimeout(openPeoplePanel, 1500);
+          setTimeout(reportParticipants, 2500);
+
+          if (captureDiarization) {
+            try {
+              const diarStartMs = Date.now();
+              const participants = new Set<string>();
+              const segments: { speaker: string; startMs: number; endMs: number }[] = [];
+              const speakingSince = new Map<string, number>();
+              const getIndicator = (item: Element): Element | null =>
+                item.querySelector('[jsname="QgSmzd"], .IisKdb');
+              const classSeen: Record<string, number> = {};
+              let indicatorObservations = 0;
+              let learnedSilenceClass: string | null = null;
+              const structural = /^(IisKdb|GF8M7d|KUNJSe|x9nQ6|VeFZv|MNVeFb|kT2pkb)$/;
+              const recomputeSilenceClass = () => {
+                let best: string | null = null;
+                let bestRatio = 0;
+                for (const c of Object.keys(classSeen)) {
+                  if (structural.test(c)) continue;
+                  const ratio = classSeen[c] / Math.max(indicatorObservations, 1);
+                  if (ratio > 0.4 && ratio < 0.995 && ratio > bestRatio) {
+                    bestRatio = ratio;
+                    best = c;
+                  }
+                }
+                if (best) learnedSilenceClass = best;
+              };
+              const barsAnimating = (ind: Element): boolean => {
+                const els = [ind, ...Array.from(ind.children)];
+                for (const el of els) {
+                  try {
+                    const cs = getComputedStyle(el as Element);
+                    if (cs.animationName && cs.animationName !== 'none' && cs.animationPlayState !== 'paused') return true;
+                  } catch { /* ignore */ }
+                }
+                return false;
+              };
+              const isItemSpeaking = (ind: Element): boolean => {
+                if (barsAnimating(ind)) return true;
+                if (learnedSilenceClass) return !ind.classList.contains(learnedSilenceClass);
+                return false;
+              };
+              let lastLearnMs = 0;
+              const tick = () => {
+                const now = Date.now() - diarStartMs;
+                const rows = Array.from(document.querySelectorAll('[role="listitem"][data-participant-id]'));
+                if (rows.length === 0) openPeoplePanel();
+                const items = rows.length > 0 ? rows : Array.from(document.querySelectorAll('[data-participant-id]'));
+                const speakingNow = new Set<string>();
+                for (const item of items) {
+                  const name = nameFromItem(item);
+                  const ind = getIndicator(item);
+                  if (ind) {
+                    indicatorObservations++;
+                    ind.classList.forEach((c) => { classSeen[c] = (classSeen[c] || 0) + 1; });
+                  }
+                  if (!name) continue;
+                  if (/note.?taker|ai.?notes|\brecording\b/i.test(name)) continue;
+                  participants.add(name);
+                  if (ind && isItemSpeaking(ind)) speakingNow.add(name);
+                }
+                if (now - lastLearnMs > 2000 && indicatorObservations > 15) {
+                  recomputeSilenceClass();
+                  lastLearnMs = now;
+                }
+                for (const [name, start] of Array.from(speakingSince)) {
+                  if (!speakingNow.has(name)) {
+                    segments.push({ speaker: name, startMs: start, endMs: now });
+                    speakingSince.delete(name);
+                  }
+                }
+                for (const name of Array.from(speakingNow)) {
+                  if (!speakingSince.has(name)) speakingSince.set(name, now);
+                }
+              };
+              const flushDiar = () => {
+                try {
+                  const now = Date.now() - diarStartMs;
+                  const segs = segments.slice();
+                  for (const [name, start] of Array.from(speakingSince)) segs.push({ speaker: name, startMs: start, endMs: now });
+                  const names = Array.from(participants);
+                  console.log(`DIAR_STATE participants=${names.length} names=[${names.join(', ')}]`);
+                  (window as any).screenAppSendDiarization(slightlySecretId, JSON.stringify({ participants: names, segments: segs }));
+                } catch { /* ignore */ }
+              };
+              setInterval(() => { try { tick(); } catch (e) { console.warn('DIAR tick error', (e as Error)?.message); } }, diarizationPollMs);
+              setInterval(flushDiar, 3000);
+              window.addEventListener('beforeunload', flushDiar);
+            } catch (e) {
+              console.warn('Diarization capture init failed', (e as Error)?.message);
+            }
+          }
 
           mediaRecorder.ondataavailable = (event: BlobEvent) => {
             if (!event.data.size) {
@@ -1328,10 +1499,40 @@ export class GoogleMeetBot extends MeetBotBase {
         activateInactivityDetectionAfter: new Date(new Date().getTime() + config.activateInactivityDetectionAfter * 60 * 1000).toISOString(),
         mimeTypes,
         botName,
+        captureDiarization: config.captureDiarization,
+        diarizationPollMs: config.diarizationPollMs,
       }
     );
+
+    const openPeoplePanelFromPlaywright = async () => {
+      for (let attempt = 1; attempt <= 8; attempt++) {
+        await this.page.waitForTimeout(attempt === 1 ? 2000 : 2500);
+        try {
+          const peopleBtn = this.page.getByRole('button', {
+            name: /^(People|Personas|Participants|Asistentes|Contactos)(\b| -)/i,
+          }).first();
+          const expanded = await peopleBtn.getAttribute('aria-expanded', { timeout: 2500 });
+          if (expanded === 'true') {
+            this._logger.info('Meet People panel already open');
+            return;
+          }
+          await peopleBtn.click({ timeout: 3000 });
+          this._logger.info('Opened Meet People panel from Playwright', { attempt });
+          return;
+        } catch (err) {
+          this._logger.info('People panel click attempt failed', {
+            attempt,
+            err: (err as Error)?.message,
+          });
+        }
+      }
+      this._logger.info('Could not click People panel from Playwright; in-page scrape will retry');
+    };
+    void openPeoplePanelFromPlaywright();
   
     this._logger.info('Waiting for recording duration', config.maxRecordingDuration, 'minutes...');
+    await recordingEvaluate;
+
     waitingPromise.promise.then(async () => {
       const context = this.page.context();
       // For an external CDP browser (the chrome-cdp sidecar), browser.close() only
