@@ -52,6 +52,7 @@ export interface IUploader {
   setRecordingDuration(durationSeconds: number): void;
   /** Display names scraped from the meeting UI (Meet people list / tiles). */
   setParticipants?(names: string[]): void;
+  setDiarizationData?(data: { participants?: string[]; segments?: { speaker: string; startMs: number; endMs: number }[] }): void;
 }
 
 // Save to disk and upload in one session
@@ -85,6 +86,7 @@ class DiskUploader implements IUploader {
   private recordingDuration?: number;
   private firstChunkReceivedAt?: number;
   private participants: string[] = [];
+  private diarizationData?: { participants?: string[]; segments?: { speaker: string; startMs: number; endMs: number }[] };
 
   private queue: Buffer[];
   private writing: boolean;
@@ -344,6 +346,11 @@ class DiskUploader implements IUploader {
 
   public setParticipants(names: string[]): void {
     this.participants = [...new Set(names.map((n) => n.trim()).filter(Boolean))];
+  }
+
+  public setDiarizationData(data: { participants?: string[]; segments?: { speaker: string; startMs: number; endMs: number }[] }): void {
+    this.diarizationData = data;
+    if (data.participants?.length) this.setParticipants(data.participants);
   }
 
   private static getFolderPath(userId: string) {
@@ -816,7 +823,8 @@ class DiskUploader implements IUploader {
               uploaderType: config.uploaderType,
               duration: this.recordingDuration,
               storage: this.lastStorageDetails,
-              participants: this.participants,
+              participants: this.diarizationData?.participants ?? this.participants,
+              diarization: this.diarizationData?.segments,
             },
           };
           await notifyRecordingCompleted(payload, this._logger);
