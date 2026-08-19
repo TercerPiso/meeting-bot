@@ -1,9 +1,8 @@
-const DEFAULT_GOOGLE_MEET_DISPLAY_NAME = 'ScreenApp AI Notes';
+const DEFAULT_GOOGLE_MEET_DISPLAY_NAME = 'Note Taker';
 
 const RISKY_DISPLAY_NAME_PATTERNS: Array<[RegExp, string]> = [
-  [/\b(?:ai[\s-]+)?note[\s-]*taker\b/gi, 'AI Notes'],
-  [/\bbot\b/gi, 'AI Notes'],
-  [/\brobot\b/gi, 'AI Notes'],
+  [/\bbot\b/gi, 'Note Taker'],
+  [/\brobot\b/gi, 'Note Taker'],
 ];
 
 export const getGoogleMeetDisplayName = (name?: string): string => {

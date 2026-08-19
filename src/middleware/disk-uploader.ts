@@ -50,6 +50,8 @@ export interface IUploader {
   uploadRecordingToRemoteStorage(options?: { forceUpload?: boolean }): Promise<boolean>;
   saveDataToTempFile(data: Buffer): Promise<boolean>;
   setRecordingDuration(durationSeconds: number): void;
+  /** Display names scraped from the meeting UI (Meet people list / tiles). */
+  setParticipants?(names: string[]): void;
 }
 
 // Save to disk and upload in one session
@@ -82,6 +84,7 @@ class DiskUploader implements IUploader {
   private lastStorageDetails?: Record<string, any>;
   private recordingDuration?: number;
   private firstChunkReceivedAt?: number;
+  private participants: string[] = [];
 
   private queue: Buffer[];
   private writing: boolean;
@@ -337,6 +340,10 @@ class DiskUploader implements IUploader {
       userId: this._userId,
       teamId: this._teamId,
     });
+  }
+
+  public setParticipants(names: string[]): void {
+    this.participants = [...new Set(names.map((n) => n.trim()).filter(Boolean))];
   }
 
   private static getFolderPath(userId: string) {
@@ -809,6 +816,7 @@ class DiskUploader implements IUploader {
               uploaderType: config.uploaderType,
               duration: this.recordingDuration,
               storage: this.lastStorageDetails,
+              participants: this.participants,
             },
           };
           await notifyRecordingCompleted(payload, this._logger);

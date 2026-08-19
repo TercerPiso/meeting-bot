@@ -139,6 +139,11 @@ export async function notifyRecordingCompleted(payload: RecordingCompletedPayloa
   ]);
 }
 
+/** Live participant list while still recording. Same webhook URL, status=participants. */
+export async function notifyMeetingParticipants(payload: RecordingCompletedPayload, logger: Logger) {
+  await sendWebhook(payload, logger);
+}
+
 export function createMeetingFailedPayload(context: MeetingFailureContext, error: unknown): MeetingFailedPayload {
   const entityId = context.botId ?? context.eventId ?? context.userId;
   const errorType = getErrorType(error);
