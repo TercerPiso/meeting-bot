@@ -15,6 +15,7 @@ import createBrowserContext, { isExternalBrowserContext } from '../lib/chromium'
 import { GOOGLE_LOBBY_MODE_HOST_TEXT, GOOGLE_REQUEST_DENIED, GOOGLE_REQUEST_TIMEOUT } from '../constants';
 import { getRecordingMimeTypesForExtension } from '../lib/recording';
 import { getGoogleMeetDisplayName } from '../util/googleMeetDisplayName';
+import { notifyMeetingParticipants } from '../services/notificationService';
 
 export class GoogleMeetBot extends MeetBotBase {
   private _logger: Logger;
@@ -641,18 +642,20 @@ export class GoogleMeetBot extends MeetBotBase {
 
     // Recording the meeting page
     this._logger.info('Begin recording...');
-    await this.recordMeetingPage({ teamId, eventId, userId, botId, uploader });
+    await this.recordMeetingPage({ teamId, eventId, userId, botId, uploader, botName: displayName });
 
     pushState('finished');
   }
 
   private async recordMeetingPage(
-    { teamId, userId, eventId, botId, uploader }: 
-    { teamId: string, userId: string, eventId?: string, botId?: string, uploader: IUploader }
+    { teamId, userId, eventId, botId, uploader, botName }: 
+    { teamId: string, userId: string, eventId?: string, botId?: string, uploader: IUploader, botName: string }
   ): Promise<void> {
     const duration = config.maxRecordingDuration * 60 * 1000;
     const inactivityLimit = config.inactivityLimit * 60 * 1000;
     const loneParticipantExitDelayMs = config.loneParticipantExitDelaySeconds * 1000;
+    const processingTime = 0.2 * 60 * 1000;
+    const waitingPromise: WaitPromise = getWaitingPromise(processingTime + duration);
 
     // Capture and send the browser console logs to Node.js context
     this.page?.on('console', async msg => {
@@ -683,12 +686,34 @@ export class GoogleMeetBot extends MeetBotBase {
       }
     });
 
+    let lastParticipantsKey = '';
+    await this.page.exposeFunction('screenAppParticipants', async (slightlySecretId: string, names: string[]) => {
+      if (slightlySecretId !== this.slightlySecretId) return;
+      const cleaned = [...new Set((names ?? []).map((n) => String(n).trim()).filter(Boolean))];
+      const key = [...cleaned].sort().join('\0');
+      if (key === lastParticipantsKey) return;
+      lastParticipantsKey = key;
+      uploader.setParticipants?.(cleaned);
+      this._logger.info('Google Meet participants scraped', { count: cleaned.length, names: cleaned });
+      await notifyMeetingParticipants({
+        recordingId: userId,
+        status: 'participants',
+        timestamp: new Date().toISOString(),
+        metadata: {
+          userId,
+          teamId,
+          botId,
+          participants: cleaned,
+        },
+      }, this._logger);
+    });
+
     const { mimeTypes } = getRecordingMimeTypesForExtension(config.uploaderFileExtension);
 
     // Inject the MediaRecorder code into the browser context using page.evaluate
     await this.page.evaluate(
-      async ({ teamId, duration, inactivityLimit, loneParticipantExitDelayMs, userId, slightlySecretId, activateInactivityDetectionAfter, activateInactivityDetectionAfterMinutes, mimeTypes }:
-      { teamId:string, userId: string, duration: number, inactivityLimit: number, loneParticipantExitDelayMs: number, slightlySecretId: string, activateInactivityDetectionAfter: string, activateInactivityDetectionAfterMinutes: number, mimeTypes: string[] }) => {
+      async ({ teamId, duration, inactivityLimit, loneParticipantExitDelayMs, userId, slightlySecretId, activateInactivityDetectionAfter, activateInactivityDetectionAfterMinutes, mimeTypes, botName }:
+      { teamId:string, userId: string, duration: number, inactivityLimit: number, loneParticipantExitDelayMs: number, slightlySecretId: string, activateInactivityDetectionAfter: string, activateInactivityDetectionAfterMinutes: number, mimeTypes: string[], botName: string }) => {
         let timeoutId: NodeJS.Timeout;
         let inactivitySilenceDetectionTimeout: NodeJS.Timeout;
         let isOnValidGoogleMeetPageInterval: NodeJS.Timeout;
@@ -745,6 +770,47 @@ export class GoogleMeetBot extends MeetBotBase {
           console.log(`Media Recorder actual mime type: ${mediaRecorder.mimeType}`);
           let chunkUploadChain: Promise<void> = Promise.resolve();
           let isStoppingRecording = false;
+          let lastReportedParticipants = '';
+
+          const scrapeParticipantNames = (): string[] => {
+            const skip = new Set(
+              [botName, 'Note Taker', 'AI Notes', 'You', 'Tú', 'Yo', 'Vos']
+                .map((s) => String(s || '').trim().toLowerCase())
+                .filter(Boolean),
+            );
+            const names = new Set<string>();
+            const add = (raw?: string | null) => {
+              let n = String(raw || '').replace(/\s+/g, ' ').trim();
+              n = n.replace(/\s*\((?:you|tú|yo|me|presentation|presentación|presenting)\)\s*/ig, '').trim();
+              n = n.replace(/['’]s presentation$/i, '').replace(/\s+is presenting$/i, '').trim();
+              if (!n || n.length < 2 || n.length > 80) return;
+              if (/^\d+$/.test(n)) return;
+              if (skip.has(n.toLowerCase())) return;
+              if (/^(people|personas|participantes?|participants?)$/i.test(n)) return;
+              names.add(n);
+            };
+
+            document.querySelectorAll('[data-self-name]').forEach((el) => add(el.getAttribute('data-self-name')));
+            document.querySelectorAll('[data-requested-participant-id], [data-participant-id]').forEach((el) => {
+              const label = el.getAttribute('aria-label');
+              if (label) add(label.split(/,|\. | — | – /)[0]);
+            });
+            document.querySelectorAll('[role="listitem"]').forEach((item) => {
+              const label = item.getAttribute('aria-label');
+              if (label) add(label.split(',')[0]);
+              const text = (item.textContent || '').split('\n').map((s) => s.trim()).find((s) => s.length > 1 && s.length < 60);
+              if (text) add(text);
+            });
+            return Array.from(names);
+          };
+
+          const reportParticipants = () => {
+            const scraped = scrapeParticipantNames();
+            const key = [...scraped].sort().join('\0');
+            if (key === lastReportedParticipants) return;
+            lastReportedParticipants = key;
+            void (window as any).screenAppParticipants(slightlySecretId, scraped);
+          };
 
           mediaRecorder.ondataavailable = (event: BlobEvent) => {
             if (!event.data.size) {
@@ -1019,6 +1085,7 @@ export class GoogleMeetBot extends MeetBotBase {
                     return;
                   }
                   detectionFailures = 0;
+                  reportParticipants();
                   if (shouldStopForParticipantCount(contributors)) {
                     console.log('Bot is alone, ending meeting.');
                     loneTestDetectionActive = false;
@@ -1259,14 +1326,12 @@ export class GoogleMeetBot extends MeetBotBase {
         slightlySecretId: this.slightlySecretId,
         activateInactivityDetectionAfterMinutes: config.activateInactivityDetectionAfter,
         activateInactivityDetectionAfter: new Date(new Date().getTime() + config.activateInactivityDetectionAfter * 60 * 1000).toISOString(),
-        mimeTypes
+        mimeTypes,
+        botName,
       }
     );
   
     this._logger.info('Waiting for recording duration', config.maxRecordingDuration, 'minutes...');
-    const processingTime = 0.2 * 60 * 1000;
-    const waitingPromise: WaitPromise = getWaitingPromise(processingTime + duration);
-
     waitingPromise.promise.then(async () => {
       const context = this.page.context();
       // For an external CDP browser (the chrome-cdp sidecar), browser.close() only
