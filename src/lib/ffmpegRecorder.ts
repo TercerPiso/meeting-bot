@@ -1,5 +1,6 @@
 import { spawn, ChildProcess } from 'child_process';
 import { Logger } from 'winston';
+import config from '../config';
 
 export class FFmpegRecorder {
   private ffmpegProcess: ChildProcess | null = null;
@@ -23,44 +24,70 @@ export class FFmpegRecorder {
     return new Promise((resolve, reject) => {
       try {
         const isWebmOutput = this.outputPath.toLowerCase().endsWith('.webm');
-        const encodingArgs = isWebmOutput ? [
-          // WebM should use VP9 video and Opus audio.
-          '-c:v', 'libvpx-vp9',
-          '-deadline', 'realtime',
-          '-cpu-used', '4',
-          '-pix_fmt', 'yuv420p',
-          '-crf', '33',
-          '-b:v', '0',
-          '-g', '50', // Keyframe interval
-          '-threads', '0',
+        const audioOnly = config.recordAudioOnly;
+        const encodingArgs = audioOnly
+          ? (isWebmOutput ? [
+              '-vn',
+              '-c:a', 'libopus',
+              '-b:a', '128k',
+              '-ar', '48000',
+              '-ac', '2',
+            ] : [
+              '-vn',
+              '-c:a', 'aac',
+              '-b:a', '128k',
+              '-ar', '44100',
+              '-ac', '2',
+              '-strict', 'experimental',
+              '-movflags', '+faststart',
+            ])
+          : (isWebmOutput ? [
+              // WebM should use VP9 video and Opus audio.
+              '-c:v', 'libvpx-vp9',
+              '-deadline', 'realtime',
+              '-cpu-used', '4',
+              '-pix_fmt', 'yuv420p',
+              '-crf', '33',
+              '-b:v', '0',
+              '-g', '50', // Keyframe interval
+              '-threads', '0',
 
-          // Audio encoding
-          '-c:a', 'libopus',
-          '-b:a', '128k',
-          '-ar', '48000',
+              // Audio encoding
+              '-c:a', 'libopus',
+              '-b:a', '128k',
+              '-ar', '48000',
+              '-ac', '2',
+            ] : [
+              // MP4-compatible video encoding
+              '-c:v', 'libx264',
+              '-preset', 'faster',
+              '-pix_fmt', 'yuv420p',
+              '-crf', '23',
+              '-g', '50', // Keyframe interval
+              '-threads', '0',
+
+              // Audio encoding
+              '-c:a', 'aac',
+              '-b:a', '128k',
+              '-ar', '44100',
+              '-ac', '2',
+              '-strict', 'experimental',
+
+              // MP4 optimization
+              '-movflags', '+faststart',
+            ]);
+
+        // FFmpeg command to capture PulseAudio (and X11 when video is needed)
+        const ffmpegArgs = audioOnly ? [
+          '-y',
+          '-loglevel', 'info',
+          '-f', 'pulse',
           '-ac', '2',
-        ] : [
-          // MP4-compatible video encoding
-          '-c:v', 'libx264',
-          '-preset', 'faster',
-          '-pix_fmt', 'yuv420p',
-          '-crf', '23',
-          '-g', '50', // Keyframe interval
-          '-threads', '0',
-
-          // Audio encoding
-          '-c:a', 'aac',
-          '-b:a', '128k',
           '-ar', '44100',
-          '-ac', '2',
-          '-strict', 'experimental',
-
-          // MP4 optimization
-          '-movflags', '+faststart',
-        ];
-
-        // FFmpeg command to capture X11 display and PulseAudio monitor
-        const ffmpegArgs = [
+          '-i', 'virtual_output.monitor',
+          ...encodingArgs,
+          this.outputPath
+        ] : [
           '-y', // Overwrite output file
           '-loglevel', 'info', // Verbose logging for debugging
 

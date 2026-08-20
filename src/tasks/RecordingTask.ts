@@ -34,8 +34,8 @@ export class RecordingTask extends Task<null, void> {
     const loneParticipantExitDelayMs = config.loneParticipantExitDelaySeconds * 1000;
 
     await this.page.evaluate(
-      async ({ teamId, duration, inactivityLimit, loneParticipantExitDelayMs, userId, slightlySecretId, activateInactivityDetectionAfter, activateInactivityDetectionAfterMinutes, mimeTypes }:
-        { teamId: string, duration: number, inactivityLimit: number, loneParticipantExitDelayMs: number, userId: string, slightlySecretId: string, activateInactivityDetectionAfter: string, activateInactivityDetectionAfterMinutes: number, mimeTypes: string[] }) => {
+      async ({ teamId, duration, inactivityLimit, loneParticipantExitDelayMs, userId, slightlySecretId, activateInactivityDetectionAfter, activateInactivityDetectionAfterMinutes, mimeTypes, audioOnly }:
+        { teamId: string, duration: number, inactivityLimit: number, loneParticipantExitDelayMs: number, userId: string, slightlySecretId: string, activateInactivityDetectionAfter: string, activateInactivityDetectionAfterMinutes: number, mimeTypes: string[], audioOnly: boolean }) => {
         let timeoutId: NodeJS.Timeout;
         let inactivitySilenceDetectionTimeout: NodeJS.Timeout;
 
@@ -78,13 +78,29 @@ export class RecordingTask extends Task<null, void> {
             preferCurrentTab: true,
           });
 
+          const audioTracks = stream.getAudioTracks();
+          const hasAudioTracks = audioTracks.length > 0;
+
           const selectedMimeType = mimeTypes.find((mimeType) => MediaRecorder.isTypeSupported(mimeType));
           if (!selectedMimeType) {
             throw new Error(`MediaRecorder does not support requested codecs: ${mimeTypes.join(', ')}`);
           }
 
-          console.log(`Media Recorder will use ${selectedMimeType} codecs...`);
-          const mediaRecorder = new MediaRecorder(stream, { mimeType: selectedMimeType });
+          let recordStream: MediaStream = stream;
+          let recordMimeType = selectedMimeType;
+          if (audioOnly) {
+            const audioOnlyMimeType = 'audio/webm;codecs=opus';
+            if (MediaRecorder.isTypeSupported(audioOnlyMimeType) && hasAudioTracks) {
+              recordStream = new MediaStream(stream.getAudioTracks());
+              recordMimeType = audioOnlyMimeType;
+              console.log('Audio-only recording enabled (video track dropped)');
+            } else {
+              console.warn('Audio-only requested but unsupported — recording full stream');
+            }
+          }
+
+          console.log(`Media Recorder will use ${recordMimeType} codecs...`);
+          const mediaRecorder = new MediaRecorder(recordStream, { mimeType: recordMimeType });
           console.log(`Media Recorder actual mime type: ${mediaRecorder.mimeType}`);
           let chunkUploadChain: Promise<void> = Promise.resolve();
           let isStoppingRecording = false;
@@ -317,7 +333,8 @@ export class RecordingTask extends Task<null, void> {
         slightlySecretId: this.slightlySecretId,
         activateInactivityDetectionAfterMinutes: config.activateInactivityDetectionAfter,
         activateInactivityDetectionAfter: new Date(new Date().getTime() + config.activateInactivityDetectionAfter * 60 * 1000).toISOString(),
-        mimeTypes
+        mimeTypes,
+        audioOnly: config.recordAudioOnly,
       }
     );
   }

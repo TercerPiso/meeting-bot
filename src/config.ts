@@ -83,6 +83,8 @@ export default {
   joinWaitTime: process.env.JOIN_WAIT_TIME_MINUTES ? Number(process.env.JOIN_WAIT_TIME_MINUTES) : 10,
   // Number of retries for transient errors (not applied to WaitingAtLobbyRetryError)
   retryCount: process.env.RETRY_COUNT ? Number(process.env.RETRY_COUNT) : 2,
+  // Record only the audio track (drops the ~10-15x heavier video; Whisper does not need it).
+  recordAudioOnly: process.env.RECORD_AUDIO_ONLY !== 'false',
   teamsPrewarmEnabled: process.env.TEAMS_PREWARM_ENABLED === 'true',
   teamsAudioStabilizationMs: process.env.TEAMS_AUDIO_STABILIZATION_MS ? Number(process.env.TEAMS_AUDIO_STABILIZATION_MS) : 1000,
   miscStorageBucket: process.env.GCP_MISC_BUCKET,

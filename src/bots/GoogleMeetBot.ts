@@ -99,7 +99,7 @@ export class GoogleMeetBot extends MeetBotBase {
     const clickContinueWithoutDevicesIfPresent = async (timeout = 5000) => {
       const continueWithoutDevicesButton = this.page
         .locator('button')
-        .filter({ hasText: /Continue without microphone and camera|Ohne Mikrofon und Kamera fortfahren/i })
+        .filter({ hasText: /Continue without microphone and camera|Ohne Mikrofon und Kamera fortfahren|Continuar sin micrófono ni cámara|Seguir sin micrófono ni cámara/i })
         .first();
 
       const hasContinuePrompt = await continueWithoutDevicesButton.isVisible({ timeout }).catch(() => false);
@@ -221,6 +221,10 @@ export class GoogleMeetBot extends MeetBotBase {
               'Teilnahme erbitten',
               'Jetzt teilnehmen',
               'Trotzdem teilnehmen',
+              'Unirse ahora',
+              'Pedir unirse',
+              'Unirse de todos modos',
+              'Unirse igualmente',
             ];
 
             let buttonClicked = false;
@@ -729,8 +733,8 @@ export class GoogleMeetBot extends MeetBotBase {
     // Do not await yet: this promise only settles when the meeting ends, and we
     // need Playwright to open the People panel while recording is already running.
     const recordingEvaluate = this.page.evaluate(
-      async ({ teamId, duration, inactivityLimit, loneParticipantExitDelayMs, userId, slightlySecretId, activateInactivityDetectionAfter, activateInactivityDetectionAfterMinutes, mimeTypes, botName, captureDiarization, diarizationPollMs }:
-      { teamId:string, userId: string, duration: number, inactivityLimit: number, loneParticipantExitDelayMs: number, slightlySecretId: string, activateInactivityDetectionAfter: string, activateInactivityDetectionAfterMinutes: number, mimeTypes: string[], botName: string, captureDiarization: boolean, diarizationPollMs: number }) => {
+      async ({ teamId, duration, inactivityLimit, loneParticipantExitDelayMs, userId, slightlySecretId, activateInactivityDetectionAfter, activateInactivityDetectionAfterMinutes, mimeTypes, botName, captureDiarization, diarizationPollMs, audioOnly }:
+      { teamId:string, userId: string, duration: number, inactivityLimit: number, loneParticipantExitDelayMs: number, slightlySecretId: string, activateInactivityDetectionAfter: string, activateInactivityDetectionAfterMinutes: number, mimeTypes: string[], botName: string, captureDiarization: boolean, diarizationPollMs: number, audioOnly: boolean }) => {
         let timeoutId: NodeJS.Timeout;
         let inactivitySilenceDetectionTimeout: NodeJS.Timeout;
         let isOnValidGoogleMeetPageInterval: NodeJS.Timeout;
@@ -782,8 +786,24 @@ export class GoogleMeetBot extends MeetBotBase {
             throw new Error(`MediaRecorder does not support requested codecs: ${mimeTypes.join(', ')}`);
           }
 
-          console.log(`Media Recorder will use ${selectedMimeType} codecs...`);
-          const mediaRecorder = new MediaRecorder(stream, { mimeType: selectedMimeType });
+          // Audio-only: record just the audio track — video is useless for
+          // transcription and ~10-15x heavier. Keeps the full `stream` for
+          // silence/presence detection; only the recorder is narrowed.
+          let recordStream: MediaStream = stream;
+          let recordMimeType = selectedMimeType;
+          if (audioOnly) {
+            const audioOnlyMimeType = 'audio/webm;codecs=opus';
+            if (MediaRecorder.isTypeSupported(audioOnlyMimeType) && hasAudioTracks) {
+              recordStream = new MediaStream(stream.getAudioTracks());
+              recordMimeType = audioOnlyMimeType;
+              console.log('Audio-only recording enabled (video track dropped)');
+            } else {
+              console.warn('Audio-only requested but unsupported — recording full stream');
+            }
+          }
+
+          console.log(`Media Recorder will use ${recordMimeType} codecs...`);
+          const mediaRecorder = new MediaRecorder(recordStream, { mimeType: recordMimeType });
           console.log(`Media Recorder actual mime type: ${mediaRecorder.mimeType}`);
           let chunkUploadChain: Promise<void> = Promise.resolve();
           let isStoppingRecording = false;
@@ -1501,6 +1521,7 @@ export class GoogleMeetBot extends MeetBotBase {
         botName,
         captureDiarization: config.captureDiarization,
         diarizationPollMs: config.diarizationPollMs,
+        audioOnly: config.recordAudioOnly,
       }
     );
 
