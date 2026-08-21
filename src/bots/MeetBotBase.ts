@@ -4,7 +4,7 @@ import { UnsupportedMeetingError, WaitingAtLobbyError } from '../error';
 import { addBotLog } from '../services/botService';
 import { Logger } from 'winston';
 import { LogSubCategory, UnsupportedMeetingCategory, WaitingAtLobbyCategory } from '../types';
-import { GOOGLE_REQUEST_DENIED, MICROSOFT_REQUEST_DENIED, ZOOM_REQUEST_DENIED } from '../constants';
+import { GOOGLE_REQUEST_DENIED_TEXTS, MICROSOFT_REQUEST_DENIED, ZOOM_REQUEST_DENIED, textIncludesAny } from '../constants';
 
 export class MeetBotBase extends AbstractMeetBot {
   protected page: Page;
@@ -30,7 +30,7 @@ export const handleWaitingAtLobbyError = async ({
   const getSubCategory = (provider: 'google' | 'microsoft' | 'zoom', bodytext: string | undefined | null): WaitingAtLobbyCategory['subCategory'] => {
     switch (provider) {
       case 'google':
-        return bodytext?.includes(GOOGLE_REQUEST_DENIED) ? 'UserDeniedRequest' : 'Timeout';
+        return textIncludesAny(bodytext, GOOGLE_REQUEST_DENIED_TEXTS) ? 'UserDeniedRequest' : 'Timeout';
       case 'microsoft':
         return bodytext?.includes(MICROSOFT_REQUEST_DENIED) ? 'UserDeniedRequest' : 'Timeout';
       case 'zoom':

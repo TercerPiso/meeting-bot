@@ -12,7 +12,12 @@ import { getWaitingPromise } from '../lib/promise';
 import { retryActionWithWait } from '../util/resilience';
 import { uploadDebugImage } from '../services/bugService';
 import createBrowserContext, { isExternalBrowserContext } from '../lib/chromium';
-import { GOOGLE_LOBBY_MODE_HOST_TEXT, GOOGLE_REQUEST_DENIED, GOOGLE_REQUEST_TIMEOUT } from '../constants';
+import {
+  GOOGLE_LOBBY_MODE_HOST_TEXTS,
+  GOOGLE_REQUEST_DENIED_TEXTS,
+  GOOGLE_REQUEST_TIMEOUT_TEXTS,
+  textIncludesAny,
+} from '../constants';
 import { getRecordingMimeTypesForExtension } from '../lib/recording';
 import { getGoogleMeetDisplayName } from '../util/googleMeetDisplayName';
 import { notifyMeetingParticipants } from '../services/notificationService';
@@ -333,10 +338,7 @@ export class GoogleMeetBot extends MeetBotBase {
 
             const detectLobbyModeHostWaitingText = async (): Promise<'WAITING_FOR_HOST_TO_ADMIT_BOT' | 'WAITING_REQUEST_TIMEOUT' | 'LOBBY_MODE_NOT_ACTIVE' | 'UNABLE_TO_DETECT_LOBBY_MODE'> => {
               try {
-                const lobbyHostWaitingTexts = [
-                  GOOGLE_LOBBY_MODE_HOST_TEXT,
-                  'Bitte warten Sie, bis Sie vom Organisator',
-                ];
+                const lobbyHostWaitingTexts = [...GOOGLE_LOBBY_MODE_HOST_TEXTS];
                 for (const text of lobbyHostWaitingTexts) {
                   const lobbyModeHostWaitingText = await this.page.getByText(text);
                   if (await lobbyModeHostWaitingText.count() > 0 && await lobbyModeHostWaitingText.first().isVisible()) {
@@ -344,10 +346,7 @@ export class GoogleMeetBot extends MeetBotBase {
                   }
                 }
 
-                const requestTimeoutTexts = [
-                  GOOGLE_REQUEST_TIMEOUT,
-                  'Niemand hat auf Ihre Teilnahmeanfrage geantwortet',
-                ];
+                const requestTimeoutTexts = [...GOOGLE_REQUEST_TIMEOUT_TEXTS];
                 for (const text of requestTimeoutTexts) {
                   const lobbyModeRequestTimeoutText = await this.page.getByText(text);
                   if (await lobbyModeRequestTimeoutText.count() > 0 && await lobbyModeRequestTimeoutText.first().isVisible()) {
@@ -471,9 +470,12 @@ export class GoogleMeetBot extends MeetBotBase {
             }
 
             try {
-              const deniedText = await this.page.getByText(GOOGLE_REQUEST_DENIED);
-              if (await deniedText.count() > 0 && await deniedText.isVisible()) {
-                botWasDeniedAccess = true;
+              for (const deniedCopy of GOOGLE_REQUEST_DENIED_TEXTS) {
+                const deniedText = await this.page.getByText(deniedCopy);
+                if (await deniedText.count() > 0 && await deniedText.first().isVisible()) {
+                  botWasDeniedAccess = true;
+                  break;
+                }
               }
             }
             catch(e) {
@@ -503,7 +505,7 @@ export class GoogleMeetBot extends MeetBotBase {
       if (!waitingAtLobbySuccess) {
         const bodyText = redirectedFromMeetBodyText ?? await this.page.evaluate(() => document.body.innerText);
 
-        const userDenied = (bodyText || '')?.includes(GOOGLE_REQUEST_DENIED);
+        const userDenied = textIncludesAny(bodyText, GOOGLE_REQUEST_DENIED_TEXTS);
 
         this._logger.error('Cant finish wait at the lobby check', {
           userDenied,
@@ -523,9 +525,13 @@ export class GoogleMeetBot extends MeetBotBase {
           continue;
         }
 
-        const errorMessage = redirectedFromMeetUrl ?
-          `Google Meet bot was redirected away from the meeting while waiting for admission: ${redirectedFromMeetUrl}` :
-          'Google Meet bot could not enter the meeting...';
+        const errorMessage = userDenied
+          ? 'Google Meet bot was denied access to the meeting'
+          : redirectedFromMeetUrl
+            ? `Google Meet bot was redirected away from the meeting while waiting for admission: ${redirectedFromMeetUrl}`
+            : lobbyRequestTimedOut
+              ? 'Google Meet bot join request timed out (nobody admitted the bot)'
+              : 'Google Meet bot could not enter the meeting...';
         throw new WaitingAtLobbyRetryError(errorMessage, bodyText ?? '', false, 0);
       }
       }
